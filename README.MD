@@ -161,13 +161,13 @@ dari root project oleh `db_config.py`.
 Kirim folder project dari laptop (PowerShell baru, bukan dari dalam sesi SSH):
 
 ```powershell
-scp -r D:\pipeline_gempa muhamdriss@20.17.105.213:~/pipeline_gempa
+scp -r D:\pipeline_gempa muhamdriss@20.17.105.213:~/pipeline_gempa_idn
 ```
 
 Lalu di VPS:
 
 ```bash
-cd ~/pipeline_gempa
+cd ~/pipeline_gempa_idn
 mkdir -p data
 cp .env.example .env
 nano .env
@@ -220,9 +220,9 @@ Sesuaikan `docker-compose.yaml` (misalnya compose resmi Airflow) dengan
 kebutuhan project:
 
 - Mount source project ke path yang dipakai DAG:
-  `- /home/muhmdriss/pipeline_gempa:/airflow/pipeline_gempa`
+  `- /home/muhmdriss/pipeline_gempa_idn:/airflow/pipeline_gempa`
 - Mount folder DAG agar terbaca Airflow:
-  `- /home/muhmdriss/pipeline_gempa/dags:/opt/airflow/dags`
+  `- /home/muhmdriss/pipeline_gempa_idn/dags:/opt/airflow/dags`
   (atau copy `dags/gempa_dag.py` ke folder `dags` Airflow)
 - Set host database di environment service Airflow:
   `GEMPA_DB_HOST: host.docker.internal` (PostgreSQL native)
