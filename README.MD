@@ -1,109 +1,295 @@
-# Pipeline Gempa BMKG — Indonesia
+# Monitoring dan Peringatan Gempa Real-Time
 
-Pipeline ETL otomatis yang memantau gempa bumi terkini dari BMKG,
-menyimpan ke PostgreSQL, dan mengirim notifikasi Telegram.
+Pipeline ETL otomatis yang memantau gempa bumi terkini dari BMKG, menyimpan
+datanya ke PostgreSQL, dan mengirim notifikasi Telegram dalam waktu WITA.
+
+Seluruh komponen sudah berjalan di VPS:
+
+- **Apache Airflow** berjalan di Docker dan menjalankan pipeline tiap 1 menit.
+- **PostgreSQL** berada di VPS (disarankan sebagai container Docker di network
+  yang sama dengan Airflow).
+- **Source project ini** di-mount ke container Airflow pada
+  `/airflow/pipeline_gempa`.
+
+Panduan ini mengasumsikan seluruh komponen berjalan di VPS, bukan di komputer
+lokal Windows.
+
+## Arsitektur
+
+```text
+VPS
+├── Docker
+│   ├── Container Airflow
+│   │   ├── DAG gempa_idn (jadwal tiap 1 menit)
+│   │   └── /airflow/pipeline_gempa  ← source project di-mount ke sini
+│   └── Container PostgreSQL
+│       └── database infogempa_id → tabel gempa_idn
+│
+├── akses keluar HTTPS → API BMKG
+└── akses keluar HTTPS → Telegram Bot API
+```
+
+Karena Airflow dan PostgreSQL berada di VPS, koneksi database dari container
+Airflow memakai **nama service/container PostgreSQL** (misalnya `postgres`),
+bukan `localhost`. Jika PostgreSQL dipasang langsung di OS VPS (bukan container),
+gunakan IP VPS atau `host.docker.internal` dengan `extra_hosts: host-gateway`.
 
 ## Alur Pipeline
 
 ```text
-extract → raw.json → transform → clean.csv → load → PostgreSQL → notif.json → notify → Telegram
+extract → raw.json → transform → clean.csv → load → PostgreSQL + notif.json → notify → Telegram
 ```
 
-| Tahap     | Script            | Input            | Output                        |
-|-----------|-------------------|------------------|-------------------------------|
-| Extract   | `src/extract.py`  | API BMKG         | `data/raw.json`               |
-| Transform | `src/transform.py`| `data/raw.json`  | `data/clean.csv`              |
-| Load      | `src/load.py`     | `data/clean.csv` | PostgreSQL + `data/notif.json`|
-| Notify    | `src/notify.py`   | `data/notif.json`| Pesan Telegram                |
+| Tahap     | Script             | Input             | Output                                |
+|-----------|--------------------|-------------------|---------------------------------------|
+| Extract   | `src/extract.py`   | API BMKG          | `data/raw.json`                       |
+| Transform | `src/transform.py` | `data/raw.json`   | `data/clean.csv`                      |
+| Load      | `src/load.py`      | `data/clean.csv`  | Tabel `gempa_idn` + `data/notif.json` |
+| Notify    | `src/notify.py`    | `data/notif.json` | Pesan Telegram (WITA)                 |
+
+Detail tiap tahap:
+
+- **Extract** — mengambil `Infogempa.gempa` dari
+  `https://data.bmkg.go.id/DataMKG/TEWS/gempaterkini.json` dengan timeout
+  20 detik, lalu menulis array hasilnya ke `data/raw.json`.
+- **Transform** — membaca `data/raw.json`, mengganti nama kolom
+  `DateTime` → `datetime_utc`, mengubah semua nama kolom dan nilai teks
+  menjadi huruf kecil, lalu menghapus duplikat berdasarkan `datetime_utc`.
+  Hasilnya ditulis ke `data/clean.csv`; DataFrame dan info-nya juga dicetak
+  ke log task.
+- **Load** — membaca `data/clean.csv` dan memasukkan 8 kolom ke tabel
+  `gempa_idn` dengan
+  `ON CONFLICT (datetime_utc) DO NOTHING RETURNING datetime_utc`. Hanya baris
+  yang benar-benar baru yang ditulis ke `data/notif.json` dengan field
+  `datetime_utc`, `magnitude`, `kedalaman`, `wilayah`, dan `potensi`.
+  Kolom `lintang` dan `bujur` tetap ada di CSV tetapi tidak dimuat ke database.
+- **Notify** — membaca `data/notif.json`, mengonversi `datetime_utc` (UTC) ke
+  WITA (UTC+8), meng-escape HTML, lalu mengirim satu pesan per data. Pesan
+  berisi waktu WITA, magnitudo, kedalaman, wilayah, potensi, dan link sumber
+  BMKG. Error pada satu data tidak menghentikan proses data berikutnya.
 
 ## Teknologi
 
-- Python (`requests`, `pandas`, `psycopg2`, `python-dotenv`)
-- PostgreSQL
-- Apache Airflow (Docker) — orkestrasi tiap 1 menit
+- Python 3 — `requests`, `pandas`, `psycopg2`, `python-dotenv`
+- PostgreSQL — disimpan di VPS
+- Apache Airflow (Docker di VPS) — DAG `gempa_idn`, jadwal tiap 1 menit
 - Telegram Bot API — notifikasi
+- Docker Compose — menjalankan Airflow (dan PostgreSQL bila containerized)
 
 ## Struktur Folder
 
 ```text
-pipline_gempa/
+pipeline_gempa/
 ├── src/
 │   ├── extract.py
 │   ├── transform.py
 │   ├── load.py
 │   ├── notify.py
 │   └── db_config.py
-├── data/
+├── dags/
+│   └── gempa_dag.py
+├── data/                  # dibuat manual, isinya digenerate pipeline
 │   ├── raw.json
 │   ├── clean.csv
 │   └── notif.json
-├── dags/
-│   └── gempa_dag.py   (arsip; yang aktif di airflow_docker/dags/)
-├── .env
-└── README.md
+├── schema.sql
+├── .env                   # tidak di-commit
+├── .env.example
+└── README.MD
 ```
+
+Tidak ada `requirements.txt`; dependensi dipasang di image/container Airflow.
 
 ## Konfigurasi (`.env`)
 
 ```ini
-DB_PASSWORD=***
-TELEGRAM_TOKEN=***
-TELEGRAM_CHAT_ID=***
+DB_PASSWORD=password_postgres
+TELEGRAM_TOKEN=123456:token_bot
+TELEGRAM_CHAT_ID=123456789
+GEMPA_DB_HOST=postgres
 ```
 
-> Di dalam Docker, host database dibaca dari variabel `GEMPA_DB_HOST=host.docker.internal`
-> (diset di `docker-compose.yaml`). Jangan memakai nama `DB_HOST` untuk ini —
-> nama tersebut dipakai internal oleh Airflow dan menyebabkan scheduler crash-loop.
+| Variabel           | Kegunaan                                        | Default     |
+|--------------------|-------------------------------------------------|-------------|
+| `DB_PASSWORD`      | Password PostgreSQL untuk user `riski`          | wajib diisi |
+| `TELEGRAM_TOKEN`   | Token bot Telegram                              | wajib diisi |
+| `TELEGRAM_CHAT_ID` | ID chat tujuan notifikasi                       | wajib diisi |
+| `GEMPA_DB_HOST`    | Host PostgreSQL yang dilihat proses pipeline    | `localhost` |
 
-## Cara Menjalankan
+Nama database (`infogempa_id`) dan user (`riski`) di-hardcode di
+`src/db_config.py`. Password dibaca dari `.env`; `.env` dimuat secara eksplisit
+dari root project oleh `db_config.py`.
 
-### Manual (Windows)
+- Dari container Airflow, isi `GEMPA_DB_HOST` dengan nama service/container
+  PostgreSQL (misalnya `postgres`). `localhost` akan menunjuk ke container
+  Airflow sendiri sehingga koneksi gagal.
+- Jangan memakai nama `DB_HOST` untuk variabel ini — nama tersebut dipakai
+  internal oleh Airflow dan dapat menyebabkan scheduler crash-loop.
+- Variabel juga bisa diberikan lewat `environment`/`env_file` di
+  `docker-compose.yaml`; nilai environment container menang atas isi `.env`.
 
-```cmd
-python D:/gempa_stg/src/extract.py
-python D:/gempa_stg/src/transform.py
-python D:/gempa_stg/src/load.py
-python D:/gempa_stg/src/notify.py
+
+## Deployment di VPS
+
+### 1. Prasyarat
+
+- VPS Linux dengan Docker Engine dan Docker Compose plugin.
+- Airflow dan PostgreSQL berada di Docker network yang sama (atau PostgreSQL
+  dapat diakses dari container Airflow).
+- Port Airflow UI (umumnya `8080`) dibuka seperlunya; port PostgreSQL `5432`
+  tidak perlu diekspos ke publik.
+- VPS dapat mengakses HTTPS ke `data.bmkg.go.id` dan `api.telegram.org`.
+
+### 2. Siapkan project dan folder data
+
+```bash
+cd /opt
+git clone <url-repo> pipeline_gempa
+cd pipeline_gempa
+mkdir -p data
+cp .env.example .env
+nano .env
 ```
 
-### Otomatis (Airflow + Docker)
+`extract.py` menulis ke `data/raw.json`, sehingga folder `data/` harus sudah
+ada. Script tidak membuat folder tersebut secara otomatis.
 
-1. Edit `docker-compose.yaml` di folder `airflow_docker`:
-   - Tambah volume mount: `- D:/pipline_gempa:/opt/airflow/pipline_gempa`
-   - Di `x-airflow-common` → `environment`:
-     - `_PIP_ADDITIONAL_REQUIREMENTS: "pandas requests psycopg2-binary python-dotenv"`
-     - `GEMPA_DB_HOST: host.docker.internal`
-2. `wsl - docker compose up -d` (bukan `restart` — restart tidak membaca ulang yaml)
-3. Copy DAG ke `C:\Users\USER\airflow_docker\dags\gempa_dag.py`
-4. Buka `http://localhost:8080` (login: `airflow` / `airflow`), unpause DAG `gempa_indo`
+### 3. Siapkan PostgreSQL
 
-Jadwal: `*/5 * * * *` (tiap 5 menit), `catchup=False`.
+Buat database dan user sesuai `src/db_config.py`:
+
+```sql
+CREATE USER riski WITH PASSWORD 'password_postgres';
+CREATE DATABASE infogempa_id OWNER riski;
+```
+
+Lalu buat tabel `gempa_idn`:
+
+```sql
+\c infogempa_id
+
+CREATE TABLE gempa_idn (
+    datetime_utc TIMESTAMPTZ PRIMARY KEY,
+    tanggal      VARCHAR(20),
+    jam          VARCHAR(20),
+    coordinates  VARCHAR(30),
+    magnitude    FLOAT,
+    kedalaman    VARCHAR(20),
+    wilayah      TEXT,
+    potensi      VARCHAR(50)
+    tanggal_ditambahkan TIMESTAMPTZ DEFAULT now();
+);
+```
+
+```
+### 4. Konfigurasi Docker Compose Airflow
+
+Sesuaikan `docker-compose.yaml` (misalnya compose resmi Airflow) dengan
+kebutuhan project:
+
+- Mount source project ke path yang dipakai DAG:
+  `- /opt/pipeline_gempa:/airflow/pipeline_gempa`
+- Mount folder DAG agar terbaca Airflow:
+  `- /opt/pipeline_gempa/dags:/opt/airflow/dags`
+  (atau copy `dags/gempa_dag.py` ke folder `dags` Airflow)
+- Set host database di environment service Airflow:
+  `GEMPA_DB_HOST: postgres` (sesuaikan nama service PostgreSQL)
+- Pastikan dependensi tersedia di image Airflow, misalnya:
+
+  ```yaml
+  environment:
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas requests psycopg2-binary python-dotenv"
+  ```
+
+- Pastikan service Airflow dan PostgreSQL berbagi network yang sama.
+- Jika `.env` ikut ter-mount bersama project, `db_config.py` dan `notify.py`
+  dapat membacanya langsung. Alternatifnya, set `DB_PASSWORD`,
+  `TELEGRAM_TOKEN`, dan `TELEGRAM_CHAT_ID` sebagai environment container.
+
+DAG memakai `SRC = "/airflow/pipeline_gempa/src"` sehingga source project harus
+tersedia tepat di path tersebut. Jika lokasi project di VPS berbeda, ubah
+`SRC` di `dags/gempa_dag.py` atau sesuaikan target mount-nya.
+
+### 5. Jalankan Airflow
+
+```bash
+docker compose up -d
+docker compose ps
+```
+
+Gunakan `up -d` (bukan `restart`) setelah mengubah `docker-compose.yaml`,
+karena `restart` tidak membaca ulang konfigurasi YAML. Tunggu service berstatus
+`(healthy)`, lalu buka `http://IP_VPS:8080` dan login sesuai kredensial yang
+diset di compose (contoh compose resmi: `airflow` / `airflow`).
+
+Aktifkan (unpause) DAG `gempa_idn`. Pipeline akan berjalan otomatis setiap
+1 menit.
+
+### 6. Uji manual (opsional)
+
+Dari dalam container Airflow:
+
+```bash
+docker compose exec airflow-scheduler bash
+cd /airflow/pipeline_gempa
+python src/extract.py
+python src/transform.py
+python src/load.py
+python src/notify.py
+```
+
+Jalankan berurutan karena tiap tahap membaca output tahap sebelumnya. Cara lain
+adalah memicu DAG secara manual dari UI Airflow.
+
+## DAG
+
+| Properti      | Nilai                                      |
+|---------------|--------------------------------------------|
+| `dag_id`      | `gempa_idn`                                |
+| Schedule      | `*/1 * * * *` (tiap 1 menit)               |
+| `start_date`  | `2026-10-08`                               |
+| `catchup`     | `False`                                    |
+| Retry         | 1 kali, delay 1 menit                      |
+| Tasks         | `extract >> transform >> load >> notify`   |
+| Source di container | `/airflow/pipeline_gempa/src`        |
 
 ## Catatan Desain
 
 - Tidak ada filter wilayah — semua gempa yang tercatat BMKG masuk ke database
-  dan Telegram. Pada run pertama setelah filter dihapus, semua gempa dianggap
-  data baru sehingga Telegram dapat menerima banyak pesan sekaligus (wajar,
-  hanya terjadi sekali).
+  dan Telegram. Pada run pertama setelah deploy, semua gempa yang sedang ada di
+  feed BMKG dianggap data baru sehingga Telegram dapat menerima banyak pesan
+  sekaligus (wajar, hanya terjadi sekali).
 - `Coordinates` disimpan sebagai teks (tidak dipecah jadi latitude/longitude) —
-  cukup untuk arsip dan notifikasi.
-- Upsert memakai `ON CONFLICT (datetime) DO NOTHING` — data duplikat tidak masuk dua kali.
-- `notif.json` hanya berisi data yang benar-benar baru; kalau kosong, Telegram tidak
-  mengirim apa pun (tidak ada notifikasi ganda).
-- Semua script memakai pola portable agar jalan di Windows maupun Docker:
+  cukup untuk arsip dan notifikasi. `lintang` dan `bujur` tidak dimuat ke
+  database dan tidak dipakai di pesan Telegram.
+- Upsert memakai `ON CONFLICT (datetime_utc) DO NOTHING` — data duplikat tidak
+  masuk dua kali.
+- `notif.json` hanya berisi data yang benar-benar baru; kalau kosong, Telegram
+  tidak mengirim apa pun (tidak ada notifikasi ganda).
+- Waktu di database disimpan sebagai `TIMESTAMPTZ` (UTC), sedangkan pesan
+  Telegram menampilkan WITA (`UTC+8`) melalui fungsi `utc_to_wita`.
+- Nilai dari JSON di-escape dengan `html.escape` sebelum dikirim agar karakter
+  `<`, `>`, dan `&` tidak merusak format HTML Telegram.
+- `notify.py` menangkap exception per data, tetapi belum memeriksa status HTTP
+  respons Telegram. Angka `terkirim` di log berarti data yang diproses tanpa
+  exception, bukan jaminan pesan diterima Telegram.
+- Semua script memakai pola portable agar path tidak bergantung folder kerja:
   ```python
   from pathlib import Path
   BASE = Path(__file__).resolve().parent.parent
   ```
-  Jangan memakai path absolut (`D:/...`) atau path relatif (`data/...`) di dalam script.
+  Jangan memakai path absolut (`D:/...`) atau path relatif (`data/...`) di dalam
+  script.
 
 ## Troubleshooting
 
 | Gejala | Penyebab | Solusi |
 |--------|----------|--------|
-| DAG tidak muncul di UI | File di folder yang salah | Copy ke `airflow_docker/dags/` |
-| Task "No Status" terus | Scheduler/worker belum healthy | Tunggu `(healthy)` di `docker compose ps` |
-| Scheduler restart berulang | Env `DB_HOST` bentrok dengan internal Airflow | Ganti jadi `GEMPA_DB_HOST` |
-| `docker compose restart` tidak mempan | `restart` tidak baca ulang yaml | Pakai `docker compose up -d` |
-| `FileNotFoundError: data/notif.json` di container | Path relatif, tergantung folder kerja | Pakai pola `BASE / "data" / ...` |
-| Garis bawah merah di `airflow.operators.bash` (VS Code) | Airflow hanya ada di Docker, bukan di Windows | Abaikan — validasi lewat UI Airflow |
+| DAG tidak muncul di UI | Folder `dags` tidak ter-mount / scheduler belum sehat | Mount `dags` ke container, cek `docker compose ps`, jalankan `airflow dags list` |
+| Task "No Status" terus | Scheduler/worker belum healthy | Tunggu status `(healthy)` di `docker compose ps` |
+| Scheduler restart berulang | Env `DB_HOST` bentrok dengan internal Airflow | Ganti menjadi `GEMPA_DB_HOST` |
+| Perubahan YAML/`.env` tidak terbaca | `docker compose restart` tidak memuat ulang config | Jalankan `docker compose up -d` (tambahkan `--force-recreate` bila perlu) |
+| `could not connect to server` / connection refused | `GEMPA_DB_HOST` masih `localhost` dari dalam container | Isi dengan nama service/container PostgreSQL atau IP VPS |
+| `FileNotFoundError` pada `data/*.json` atau `*.csv` | Folder `data/` belum ada atau task sebelumnya gagal | Jalankan `mkdir -p data`, cek log task sebelumnya, jalankan task berurutan |
+| Tidak ada pesan Telegram | `notif.json` kosong (tidak ada gempa baru) atau kredensial salah | Cek log task `load`/`notify`, isi `.env`, dan `TELEGRAM_CHAT_ID` |
+| UI Airflow tidak bisa dibuka | Port belum dipublish atau diblokir firewall VPS | Cek mapping port di compose dan aturan firewall/security group |

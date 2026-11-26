@@ -8,8 +8,8 @@ load_dotenv(BASE / ".env")
 
 def get_conn():
     return psycopg2.connect(
-        dbname= "db_gempa",
-        user= "postgres",
+        dbname= "infogempa_id",
+        user= "riski",
         password=os.getenv("DB_PASSWORD"),
         host=os.getenv("GEMPA_DB_HOST", "localhost"),
     )
