@@ -5,34 +5,45 @@ datanya ke PostgreSQL, dan mengirim notifikasi Telegram dalam waktu WITA.
 
 Seluruh komponen sudah berjalan di VPS:
 
-- **Apache Airflow** berjalan di Docker dan menjalankan pipeline tiap 1 menit.
-- **PostgreSQL** berada di VPS (disarankan sebagai container Docker di network
-  yang sama dengan Airflow).
+- **Apache Airflow 3.3.2** berjalan di Docker dan menjalankan pipeline tiap 1 menit.
+- **PostgreSQL 16 terpasang native di VPS** (bukan container).
 - **Source project ini** di-mount ke container Airflow pada
   `/airflow/pipeline_gempa`.
 
 Panduan ini mengasumsikan seluruh komponen berjalan di VPS, bukan di komputer
 lokal Windows.
 
+## Status live (per 25 Nov 2026)
+
+- Airflow sehat: apiserver, scheduler, worker, triggerer, dag-processor + redis:7.2 (broker), compose project `airflow_docker`.
+- DAG `gempa_idn` jalan tiap 1 menit.
+- Channel Telegram INFO GEMPA IDN (https://t.me/infgmpidn), bot @infogmp_bot admin.
+- Catatan: restart Airflow masih diperlukan agar DAG memakai `TELEGRAM_CHAT_ID`
+  channel — saat ini notifikasi masih mengarah ke DM pribadi.
+
 ## Arsitektur
 
 ```text
 VPS
-├── Docker
-│   ├── Container Airflow
+├── Docker (compose project: airflow_docker)
+│   ├── Container Airflow 3.3.2
+│   │   ├── apiserver, scheduler, worker, triggerer, dag-processor
 │   │   ├── DAG gempa_idn (jadwal tiap 1 menit)
 │   │   └── /airflow/pipeline_gempa  ← source project di-mount ke sini
-│   └── Container PostgreSQL
-│       └── database infogempa_id → tabel gempa_idn
+│   └── redis:7.2 (broker)
+│
+├── PostgreSQL 16 (native, di luar Docker)
+│   └── database infogempa_id → tabel gempa_idn
+│       (container Airflow terhubung lewat host.docker.internal)
 │
 ├── akses keluar HTTPS → API BMKG
 └── akses keluar HTTPS → Telegram Bot API
 ```
 
-Karena Airflow dan PostgreSQL berada di VPS, koneksi database dari container
-Airflow memakai **nama service/container PostgreSQL** (misalnya `postgres`),
-bukan `localhost`. Jika PostgreSQL dipasang langsung di OS VPS (bukan container),
-gunakan IP VPS atau `host.docker.internal` dengan `extra_hosts: host-gateway`.
+PostgreSQL terpasang native di OS VPS (bukan container), jadi dari container
+Airflow koneksi memakai `host.docker.internal` (dengan
+`extra_hosts: host-gateway` di `docker-compose.yaml`) atau IP VPS — bukan
+`localhost` dan bukan nama service `postgres`.
 
 ## Alur Pipeline
 
@@ -71,10 +82,10 @@ Detail tiap tahap:
 ## Teknologi
 
 - Python 3 — `requests`, `pandas`, `psycopg2`, `python-dotenv`
-- PostgreSQL — disimpan di VPS
-- Apache Airflow (Docker di VPS) — DAG `gempa_idn`, jadwal tiap 1 menit
+- PostgreSQL 16 native di VPS (bukan container)
+- Apache Airflow 3.3.2 (Docker di VPS) — DAG `gempa_idn`, jadwal tiap 1 menit
 - Telegram Bot API — notifikasi
-- Docker Compose — menjalankan Airflow (dan PostgreSQL bila containerized)
+- Docker Compose — menjalankan Airflow (compose project `airflow_docker`)
 
 ## Struktur Folder
 
@@ -106,46 +117,57 @@ Tidak ada `requirements.txt`; dependensi dipasang di image/container Airflow.
 DB_PASSWORD=password_postgres
 TELEGRAM_TOKEN=123456:token_bot
 TELEGRAM_CHAT_ID=123456789
-GEMPA_DB_HOST=postgres
+GEMPA_DB_HOST=host.docker.internal
 ```
 
-| Variabel           | Kegunaan                                        | Default     |
-|--------------------|-------------------------------------------------|-------------|
-| `DB_PASSWORD`      | Password PostgreSQL untuk user `riski`          | wajib diisi |
-| `TELEGRAM_TOKEN`   | Token bot Telegram                              | wajib diisi |
-| `TELEGRAM_CHAT_ID` | ID chat tujuan notifikasi                       | wajib diisi |
-| `GEMPA_DB_HOST`    | Host PostgreSQL yang dilihat proses pipeline    | `localhost` |
+| Variabel           | Kegunaan                                        | Default              |
+|--------------------|-------------------------------------------------|----------------------|
+| `DB_PASSWORD`      | Password PostgreSQL untuk user `riski`          | wajib diisi          |
+| `TELEGRAM_TOKEN`   | Token bot Telegram                              | wajib diisi          |
+| `TELEGRAM_CHAT_ID` | ID chat tujuan notifikasi                       | wajib diisi          |
+| `GEMPA_DB_HOST`    | Host PostgreSQL yang dilihat proses pipeline    | `host.docker.internal` |
 
 Nama database (`infogempa_id`) dan user (`riski`) di-hardcode di
 `src/db_config.py`. Password dibaca dari `.env`; `.env` dimuat secara eksplisit
 dari root project oleh `db_config.py`.
 
-- Dari container Airflow, isi `GEMPA_DB_HOST` dengan nama service/container
-  PostgreSQL (misalnya `postgres`). `localhost` akan menunjuk ke container
-  Airflow sendiri sehingga koneksi gagal.
+- Dari container Airflow, isi `GEMPA_DB_HOST` dengan `host.docker.internal`
+  dan tambahkan `extra_hosts: - "host.docker.internal:host-gateway"` pada
+  service Airflow di `docker-compose.yaml`. Alternatifnya, isi dengan IP VPS.
+  `localhost` akan menunjuk ke container Airflow sendiri sehingga koneksi gagal.
 - Jangan memakai nama `DB_HOST` untuk variabel ini — nama tersebut dipakai
   internal oleh Airflow dan dapat menyebabkan scheduler crash-loop.
 - Variabel juga bisa diberikan lewat `environment`/`env_file` di
   `docker-compose.yaml`; nilai environment container menang atas isi `.env`.
 
+> **Penting:** `schema.sql` saat ini masih membuat tabel `gempa_bmkg`, sedangkan
+> `src/load.py` memasukkan data ke tabel `gempa_idn`. Samakan nama tabel di
+> salah satu file sebelum membuat tabel, misalnya ubah `schema.sql` menjadi
+> `CREATE TABLE gempa_idn (...)`.
 
 ## Deployment di VPS
 
 ### 1. Prasyarat
 
 - VPS Linux dengan Docker Engine dan Docker Compose plugin.
-- Airflow dan PostgreSQL berada di Docker network yang sama (atau PostgreSQL
-  dapat diakses dari container Airflow).
+- PostgreSQL 16 native sudah terpasang di VPS dan dapat diakses dari container
+  Airflow lewat `host.docker.internal` (`extra_hosts: host-gateway`).
 - Port Airflow UI (umumnya `8080`) dibuka seperlunya; port PostgreSQL `5432`
   tidak perlu diekspos ke publik.
 - VPS dapat mengakses HTTPS ke `data.bmkg.go.id` dan `api.telegram.org`.
 
 ### 2. Siapkan project dan folder data
 
+Kirim folder project dari laptop (PowerShell baru, bukan dari dalam sesi SSH):
+
+```powershell
+scp -r D:\pipeline_gempa muhamdriss@20.17.105.213:~/pipeline_gempa
+```
+
+Lalu di VPS:
+
 ```bash
-cd /opt
-git clone <url-repo> pipeline_gempa
-cd pipeline_gempa
+cd ~/pipeline_gempa
 mkdir -p data
 cp .env.example .env
 nano .env
@@ -156,7 +178,8 @@ ada. Script tidak membuat folder tersebut secara otomatis.
 
 ### 3. Siapkan PostgreSQL
 
-Buat database dan user sesuai `src/db_config.py`:
+PostgreSQL native di VPS (bukan container). Buat database dan user sesuai
+`src/db_config.py`:
 
 ```sql
 CREATE USER riski WITH PASSWORD 'password_postgres';
@@ -176,24 +199,38 @@ CREATE TABLE gempa_idn (
     magnitude    FLOAT,
     kedalaman    VARCHAR(20),
     wilayah      TEXT,
-    potensi      VARCHAR(50)
-    tanggal_ditambahkan TIMESTAMPTZ DEFAULT now();
+    potensi      VARCHAR(50),
+    tanggal_ditambahkan TIMESTAMPTZ DEFAULT now()
 );
 ```
 
+Kolom `tanggal_ditambahkan` terisi otomatis dengan jam baris masuk ke database
+(`datetime_utc` = jam gempanya terjadi).
+
+Jika memakai `schema.sql`, ubah dulu nama tabelnya dari `gempa_bmkg` menjadi
+`gempa_idn`, lalu jalankan dengan user `riski`:
+
+```bash
+psql -h <host> -U riski -d infogempa_id -f schema.sql
 ```
+
 ### 4. Konfigurasi Docker Compose Airflow
 
 Sesuaikan `docker-compose.yaml` (misalnya compose resmi Airflow) dengan
 kebutuhan project:
 
 - Mount source project ke path yang dipakai DAG:
-  `- /opt/pipeline_gempa:/airflow/pipeline_gempa`
+  `- /home/muhmdriss/pipeline_gempa:/airflow/pipeline_gempa`
 - Mount folder DAG agar terbaca Airflow:
-  `- /opt/pipeline_gempa/dags:/opt/airflow/dags`
+  `- /home/muhmdriss/pipeline_gempa/dags:/opt/airflow/dags`
   (atau copy `dags/gempa_dag.py` ke folder `dags` Airflow)
 - Set host database di environment service Airflow:
-  `GEMPA_DB_HOST: postgres` (sesuaikan nama service PostgreSQL)
+  `GEMPA_DB_HOST: host.docker.internal` (PostgreSQL native)
+- Tambahkan pada service Airflow:
+  ```yaml
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  ```
 - Pastikan dependensi tersedia di image Airflow, misalnya:
 
   ```yaml
@@ -201,7 +238,6 @@ kebutuhan project:
     _PIP_ADDITIONAL_REQUIREMENTS: "pandas requests psycopg2-binary python-dotenv"
   ```
 
-- Pastikan service Airflow dan PostgreSQL berbagi network yang sama.
 - Jika `.env` ikut ter-mount bersama project, `db_config.py` dan `notify.py`
   dapat membacanya langsung. Alternatifnya, set `DB_PASSWORD`,
   `TELEGRAM_TOKEN`, dan `TELEGRAM_CHAT_ID` sebagai environment container.
@@ -289,7 +325,9 @@ adalah memicu DAG secara manual dari UI Airflow.
 | Task "No Status" terus | Scheduler/worker belum healthy | Tunggu status `(healthy)` di `docker compose ps` |
 | Scheduler restart berulang | Env `DB_HOST` bentrok dengan internal Airflow | Ganti menjadi `GEMPA_DB_HOST` |
 | Perubahan YAML/`.env` tidak terbaca | `docker compose restart` tidak memuat ulang config | Jalankan `docker compose up -d` (tambahkan `--force-recreate` bila perlu) |
-| `could not connect to server` / connection refused | `GEMPA_DB_HOST` masih `localhost` dari dalam container | Isi dengan nama service/container PostgreSQL atau IP VPS |
+| `could not connect to server` / connection refused | `GEMPA_DB_HOST` masih `localhost` dari dalam container | Isi dengan `host.docker.internal` (pastikan `extra_hosts: host-gateway` ada di compose) atau IP VPS |
+| `relation "gempa_idn" does not exist` | `schema.sql` membuat tabel `gempa_bmkg` | Buat tabel `gempa_idn` atau samakan nama di `schema.sql`/`load.py` |
+| PostgreSQL Docker dan native bentrok di port 5432 | Dua PostgreSQL tidak boleh jalan barengan di port yang sama | Jangan jalankan PostgreSQL container — pakai yang native saja |
 | `FileNotFoundError` pada `data/*.json` atau `*.csv` | Folder `data/` belum ada atau task sebelumnya gagal | Jalankan `mkdir -p data`, cek log task sebelumnya, jalankan task berurutan |
 | Tidak ada pesan Telegram | `notif.json` kosong (tidak ada gempa baru) atau kredensial salah | Cek log task `load`/`notify`, isi `.env`, dan `TELEGRAM_CHAT_ID` |
 | UI Airflow tidak bisa dibuka | Port belum dipublish atau diblokir firewall VPS | Cek mapping port di compose dan aturan firewall/security group |
